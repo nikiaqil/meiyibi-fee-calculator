@@ -1,0 +1,44 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const html=fs.readFileSync(__dirname+'/index.html','utf8');
+const E=vm.runInNewContext(html.match(/<script id="fee-engine">([\s\S]*?)<\/script>/)[1]+';FeeEngine');
+const C=E.cents;let count=0;
+function check(name,fn){fn();count++;console.log('PASS',name);}
+function calc(kind,side,amount,sell=amount,orders=1,rates=E.defaults){return E.calculate({kind,side,buy:C(amount),sell:C(sell),orders,rates});}
+function t(p={}){return E.reverseT({kind:'stock',sellPrice:'10',quantity:'1000',tick:'0.01',...p});}
+check('新截图小数费率正确转换，A股最低5，ETF最低0.2',()=>{assert.equal(E.defaults.stock.rate,'0.1654');assert.equal(E.defaults.etf.rate,'0.1');assert.equal(E.defaults.lof.rate,'0.1');assert.equal(E.defaults.stock.min,'5');assert.equal(E.defaults.etf.min,'0.2');assert.equal(E.defaults.lof.min,'');});
+check('A股1万元买入5.10元，卖出10.10元（过户费另收口径）',()=>{assert.equal(calc('stock','buy','10000').fee,510n);assert.equal(calc('stock','sell','10000').fee,1010n);});
+check('A股10万元佣金16.54元，买入17.54元，卖出67.54元',()=>{assert.equal(calc('stock','buy','100000').commission,1654n);assert.equal(calc('stock','buy','100000').fee,1754n);assert.equal(calc('stock','sell','100000').fee,6754n);});
+check('ETF1万元买入和卖出各1元，没有股票税费',()=>{for(const side of ['buy','sell']){const r=calc('etf',side,'10000');assert.equal(r.fee,100n);assert.equal(r.transfer,0n);assert.equal(r.stamp,0n);}});
+check('ETF最低0.2元及临界点2000元',()=>{assert.equal(calc('etf','buy','1000').fee,20n);assert.equal(calc('etf','buy','2000').fee,20n);assert.equal(calc('etf','buy','2100').fee,21n);});
+check('LOF未知最低佣金不会冒充已确认无最低',()=>{assert.equal(E.pending('lof').length,1);assert.equal(calc('lof','buy','1000').fee,10n);const r=structuredClone(E.defaults);r.lof.min='0';assert.equal(E.pending('lof',r).length,0);});
+check('过户费另收、已含、未知三种口径',()=>{assert.equal(E.pending('stock').length,1);assert.equal(E.pending('etf').length,0);const r=structuredClone(E.defaults);r.transferMode='included';assert.equal(calc('stock','buy','10000','10000',1,r).fee,500n);assert.equal(calc('stock','sell','10000','10000',1,r).fee,1000n);assert.equal(E.pending('stock',r).length,0);r.transferMode='separate';assert.equal(calc('stock','buy','10000','10000',1,r).fee,510n);assert.equal(E.pending('stock',r).length,0);});
+check('ETF分笔逐笔计最低佣金',()=>{assert.equal(calc('etf','buy','3000','3000',2).fee,40n);assert.equal(calc('etf','round','3000','3000',2).fee,80n);});
+check('做T：A股10元卖1000股，9.98买净赚4.80元',()=>{const r=t({buyPrice:'9.98'});assert.equal(r.profitable.price,'9.98');assert.equal(r.planned.profit,480n);assert.equal(t({buyPrice:'9.99'}).planned.profit,-520n);});
+check('做T：ETF10元卖1000份，9.998保本，9.997开始赚钱',()=>{const r=t({kind:'etf',tick:'0.001',buyPrice:'9.98'});assert.equal(r.nonloss.price,'9.998');assert.equal(r.nonloss.profit,0n);assert.equal(r.profitable.price,'9.997');assert.equal(r.profitable.profit,100n);assert.equal(r.planned.profit,1800n);});
+check('做T：自定义收益目标且下一档报价达不到目标',()=>{const r=t({target:'100'});assert.equal(r.profitable.price,'9.88');assert.equal(r.profitable.profit,10480n);assert(t({buyPrice:'9.89'}).planned.profit<10000n);});
+check('做T：改变最低佣金与过户费计费同步更新',()=>{const r=structuredClone(E.defaults);r.transferMode='included';assert.equal(t({rates:r,buyPrice:'9.98'}).planned.profit,500n);r.etf.min='5';assert.equal(t({kind:'etf',tick:'0.001',rates:r}).profitable.price,'9.989');});
+check('做T：小额无可行买回价与非法输入',()=>{assert.equal(t({quantity:'1'}).profitable,null);for(const p of [{buyPrice:'9.999'},{quantity:'1.2'},{buyOrders:0},{sellPrice:'0'}])assert.throws(()=>t(p));});
+check('不同价格精度、分笔、目标边界与逐报价穷举结果一致',()=>{for(const kind of ['stock','etf','lof'])for(const quantity of ['10','1000'])for(const n of [1,2]){const r=t({kind,quantity,sellPrice:'1.05',sellOrders:n,buyOrders:n});for(const[g,result]of [[0n,r.nonloss],[1n,r.profitable],...r.targets.map(x=>[x.goal,x.result])]){let best=null;for(let i=1;i<=105;i++){const price=(i/100).toFixed(2),amount=E.turnover(price,quantity);if(amount<BigInt(n))continue;const sellAmount=E.turnover('1.05',quantity);const sold=E.calculate({kind,side:'sell',buy:sellAmount,sell:sellAmount,orders:n}),bought=E.calculate({kind,side:'buy',buy:amount,sell:amount,orders:n}),profit=sold.cash-bought.cash;if(profit>=g)best={price,profit};}assert.equal(result?.price??null,best?.price??null);if(best)assert.equal(result.profit,best.profit);}}});
+check('保本卖出额覆盖全部费用，低1分不能保本',()=>{for(const kind of ['stock','etf','lof']){const buy=C('10000'),s=E.breakEven(buy,kind,1,E.defaults);const result=sell=>E.calculate({kind,side:'round',buy,sell});assert(result(s).cash>=0n);assert(result(s-1n).cash<0n);}});
+check('不支持截图外的国债品种',()=>{assert.equal(Object.keys(E.names).join(','),'stock,etf,lof');assert.throws(()=>calc('bookBond','buy','10000'));});
+check('所有脚本语法、静态元素引用、隔离本地存储和原版费率',()=>{for(const m of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new vm.Script(m[1]);const ids=[...html.matchAll(/\bid="([^"]+)"/g)].map(m=>m[1]);assert.equal(new Set(ids).size,ids.length);for(const m of html.matchAll(/\$\('([^']+)'\)/g))assert(ids.includes(m[1]),m[1]);assert(html.includes("key='every-trade-fees-public-v1'"));assert(fs.readFileSync(__dirname+'/../fee-calculator/index.html','utf8').includes("stock:{rate:'0.0691',min:'5'}"));});
+const f=(patch={})=>E.forwardT({kind:'stock',buyPrice:'10',quantity:'1000',tick:'0.01',...patch});
+check('先买后卖：10元买1000股，10.02元卖净赚4.79元',()=>{const r=f({sellPrice:'10.02'});assert.equal(r.profitable.price,'10.02');assert.equal(r.nonloss.price,'10.02');assert.equal(r.cost,1000510n);assert.equal(r.bought.fee,510n);assert.equal(r.planned.fee,1011n);assert.equal(r.planned.profit,479n);assert.equal(f({sellPrice:'10.01'}).planned.profit,-521n);});
+check('先买后卖：目标100元及下一档边界',()=>{const r=f({target:'100'});assert.equal(r.profitable.price,'10.12');assert.equal(r.profitable.profit,10474n);assert(f({sellPrice:'10.11'}).planned.profit<10000n);});
+check('先买后卖：ETF零收益与严格盈利，LOF无股票税费',()=>{for(const kind of ['etf','lof']){const r=f({kind,tick:'0.001',sellPrice:'10.002'});assert.equal(r.nonloss.price,'10.002');assert.equal(r.nonloss.profit,0n);assert.equal(r.profitable.price,'10.003');assert.equal(r.planned.profit,0n);assert.equal(r.planned.stamp,0n);assert.equal(r.planned.transfer,0n);}});
+check('先买后卖：均价、分笔、改费率、空计划价与非法输入',()=>{assert.equal(f({buyPrice:'10.005'}).bought.amount,1000500n);assert.equal(f().planned,null);const r=f({buyOrders:3,sellOrders:2,sellPrice:'10.10'}),b=calc('stock','buy','10000','10000',3),s=calc('stock','sell','10100','10100',2);assert.equal(r.planned.profit,s.cash-b.cash);const rates=structuredClone(E.defaults);rates.stock={rate:'0',min:'0'};rates.transfer='0';rates.stamp='0';assert.equal(f({rates}).nonloss.price,'10.00');assert.equal(f({rates}).profitable.price,'10.01');for(const p of [{sellPrice:'10.002'},{sellPrice:'0'},{buyPrice:'0'},{quantity:'1.5'},{target:'-1'},{buyOrders:0},{sellOrders:1.5},{kind:'bookBond'},{tick:'0.02'}])assert.throws(()=>f(p));});
+check('先买后卖：金额上限、无法达到目标',()=>{const r=f({buyPrice:'100000000',quantity:'10000'});assert.equal(r.nonloss,null);assert.equal(r.profitable,null);assert.equal(f({target:'1000000000000'}).profitable,null);});
+check('先买后卖：逐报价穷举验证最小盈利/保本/目标价',()=>{
+ const custom=structuredClone(E.defaults);custom.stock={rate:'123.456',min:'0.02'};custom.transfer='234.567';custom.stamp='345.678';
+ for(const rates of [E.defaults,custom])for(const kind of ['stock','etf','lof'])for(const quantity of ['1','10','100'])for(const orders of [1,3]){
+  const r=f({rates,kind,quantity,buyPrice:'0.035',tick:'0.01',buyOrders:orders,sellOrders:orders,target:'0.05'});
+  for(const [goal,candidate]of [[0n,r.nonloss],[5n,r.profitable]]){
+   let best=null;
+   for(let i=1;i<=5000;i++){const price=(i/100).toFixed(2),amount=E.turnover(price,quantity);if(amount<BigInt(orders))continue;const sold=E.calculate({kind,side:'sell',buy:amount,sell:amount,orders,rates}),profit=sold.cash-r.cost;if(profit>=goal){best={price,profit};break;}}
+   assert.equal(candidate?.price??null,best?.price??null);if(best)assert.equal(candidate.profit,best.profit);
+  }
+ }
+});
+check('先买后卖：过户费三种口径和LOF待确认规则保持一致',()=>{for(const mode of ['unknown','separate','included']){const rates=structuredClone(E.defaults);rates.transferMode=mode;const r=f({rates,sellPrice:'10.02'});assert.equal(r.planned.profit,mode==='included'?499n:479n);assert.equal(E.pending('stock',rates).length,mode==='unknown'?1:0);}assert.equal(E.pending('lof').length,1);const rates=structuredClone(E.defaults);rates.lof.min='5';assert(f({kind:'lof',tick:'0.001',rates}).profitable.price>'10.003');});
+check('先买后卖：ETF最低0.2元，低价小额交易计入双边最低佣金',()=>{const r=f({kind:'etf',buyPrice:'1',quantity:'100',tick:'0.001',sellPrice:'1.004'});assert.equal(r.bought.fee,20n);assert.equal(r.planned.fee,20n);assert.equal(r.planned.profit,0n);assert.equal(r.nonloss.price,'1.004');assert.equal(r.profitable.price,'1.005');});
+console.log(`\n${count} checks passed.`);
